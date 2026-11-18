@@ -5604,9 +5604,10 @@ async def process_endpoint(
     max_minutes: Optional[str] = Form(None),
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
+    manual_clips: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
-    if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
+    if not api_key and not manual_clips and not (llm_backend.active() and not BILLING_ENABLED):
         # Self-host with an OpenAI-compatible server configured needs no
         # Google key for the core pipeline: the moment picker runs there and
         # the frame-based stages degrade on their own (layout_picker returns
@@ -5638,6 +5639,9 @@ async def process_endpoint(
         max_minutes = body.get("max_minutes")
         source_start = body.get("source_start")
         source_end = body.get("source_end")
+        manual_clips = body.get("manual_clips")
+        if manual_clips is not None and not isinstance(manual_clips, str):
+            manual_clips = json.dumps(manual_clips)  # accept a JSON array directly, not just a JSON-string of one
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -5788,12 +5792,29 @@ async def process_endpoint(
         env["AUTO_CAPTIONS"] = "0"
         print(f"[captions] job={job_id} auto-captions off")
 
+    if manual_clips and not url:
+        raise HTTPException(status_code=400, detail="manual_clips requires a url.")
+    if manual_clips:
+        try:
+            parsed = json.loads(manual_clips)
+            if not (isinstance(parsed, list) and parsed
+                    and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in parsed)):
+                raise ValueError("expected a non-empty array of [start, end] pairs")
+            for s, e in parsed:
+                float(s); float(e)
+        except (ValueError, TypeError) as e:
+            raise HTTPException(status_code=400,
+                                detail=f"manual_clips must be a JSON array of [start, end] "
+                                       f"second pairs: {e}")
+
     input_path = None
     if url:
         # Keep the downloaded source inside the job dir: the clip editor's
         # re-render path cuts new segments from it, and it ages out with the
         # rest of the job (retention window + OUTPUT_MAX_GB cap) either way.
         cmd.extend(["-u", url, "--keep-original"])
+        if manual_clips:
+            cmd.extend(["--manual-clips", manual_clips])
     elif thumb_session:
         # Hardlink (or copy) the session's video under the job's name so source
         # lookup, the clip editor and the preview treat it exactly like a normal

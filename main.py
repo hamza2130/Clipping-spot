@@ -865,18 +865,24 @@ def _content_block(error_text):
 
 
 def download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
-                           cap_minutes=None, route_out=None):
+                           cap_minutes=None, route_out=None, clip_range=None):
     """Download ``url`` with only public addresses resolvable (ssrf_guard): the
     checked URL is not the only one yt-dlp talks to (redirects, URLs read out
-    of an extracted page, a DNS answer that changes after the check)."""
+    of an extracted page, a DNS answer that changes after the check).
+
+    ``clip_range`` (start_seconds, end_seconds): fetch only that stretch of
+    the source instead of the whole thing — same ranged-download path as
+    ``cap_minutes``, just with the caller's own window instead of (0, cap).
+    """
     import ssrf_guard
     with ssrf_guard.guarded():
         return _download_youtube_video(url, output_dir, on_audio=on_audio, allow_paid=allow_paid,
-                                       cap_minutes=cap_minutes, route_out=route_out)
+                                       cap_minutes=cap_minutes, route_out=route_out,
+                                       clip_range=clip_range)
 
 
 def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
-                            cap_minutes=None, route_out=None):
+                            cap_minutes=None, route_out=None, clip_range=None):
     """
     Downloads a YouTube video using yt-dlp.
     Returns the path to the downloaded video and the video title.
@@ -1085,7 +1091,9 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
         # on a 19-min cap took 8 min ranged against ~30 s whole (prod,
         # 25-sep-2026); a finished 6.7 h livestream is ~13 GB whole.
         ranged = False
-        if _range_cap:
+        if clip_range:
+            ranged = True
+        elif _range_cap:
             _dur = info.get('duration')
             ranged = not _dur or float(_dur) > max(3 * _range_cap, _range_cap + 2700)
         # Once per download, and not on the per-GB proxy (that is paid bytes,
@@ -1108,9 +1116,13 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
         }
         if ranged:
             from yt_dlp.utils import download_range_func
-            dl_opts['download_ranges'] = download_range_func(None, [(0, _range_cap)])
-            print(f"✂️ Source is {'of unknown length' if not info.get('duration') else 'longer than the paid minutes'}"
-                  f": downloading only the first {_range_cap / 60:.0f} min.")
+            _dl_range = clip_range if clip_range else (0, _range_cap)
+            dl_opts['download_ranges'] = download_range_func(None, [_dl_range])
+            if clip_range:
+                print(f"✂️ Downloading only {clip_range[0]:.1f}s-{clip_range[1]:.1f}s of the source.")
+            else:
+                print(f"✂️ Source is {'of unknown length' if not info.get('duration') else 'longer than the paid minutes'}"
+                      f": downloading only the first {_range_cap / 60:.0f} min.")
         with yt_dlp.YoutubeDL(dl_opts) as ydl:
             if info.get('_type', 'video') == 'video' and info.get('formats'):
                 ydl.process_ie_result(info, download=True)
@@ -1969,6 +1981,111 @@ def _free_gpu_cache():
         pass
 
 
+def process_manual_clips(url, clip_ranges, output_dir, output_format="auto"):
+    """Render explicit (start, end) timestamps directly, skipping Gemini
+    clip-selection AND — the actual point of this mode — transcription of
+    the whole source. Each requested window is downloaded and transcribed
+    on its own, as a small clip, instead of the whole video going through
+    both passes before anything is cut. A 2-3h video with a handful of
+    known clips drops from "transcribe the whole thing" to "transcribe a
+    few tens of seconds", which is the only thing that was ever slow.
+
+    ``clip_ranges``: list of (start_seconds, end_seconds), absolute
+    positions in the source. Writes a standard ``*_metadata.json`` (shorts
+    + a transcript covering just the requested windows, offset onto the
+    source's absolute timeline) so the dashboard/editor read it exactly
+    like an AI-selected job — the only difference is how ``shorts`` and
+    ``transcript`` were built.
+
+    Sequential, not parallel: each small download reuses the same temp
+    filename (same URL every time), so the previous clip must be fully
+    rendered and off disk before the next download starts.
+    """
+    if not clip_ranges:
+        raise ValueError("No clip ranges given.")
+
+    print(f"✂️ Manual-clips mode: {len(clip_ranges)} requested range(s) — "
+          f"skipping full-video download, transcription and AI selection.")
+
+    import layout_ranges as _layouts
+
+    video_title = None
+    shorts = []
+    combined_segments = []
+
+    for i, (start, end) in enumerate(clip_ranges):
+        if end <= start:
+            print(f"   ⚠️ Clip {i + 1}: end ({end}) <= start ({start}) — skipping.")
+            continue
+        print(f"\n🎬 Fetching clip {i + 1}: {start:.1f}s - {end:.1f}s")
+        small_path, title = download_youtube_video(url, output_dir, clip_range=(start, end))
+        if video_title is None:
+            video_title = title
+
+        try:
+            transcript = transcribe_video(small_path)
+        except Exception as e:
+            print(f"   ⚠️ Transcription failed for clip {i + 1} ({type(e).__name__}: {e}); "
+                  f"it will ship without captions.")
+            transcript = {"language": "none", "segments": []}
+
+        # This clip's own transcript is 0-based (relative to the small file
+        # just downloaded). Shift it onto the source's absolute timeline so
+        # auto_caption_clip's start/end slicing — built for the single
+        # full-video transcript the AI pipeline produces — works unmodified.
+        for seg in transcript.get("segments", []):
+            seg["start"] = float(seg.get("start", 0)) + start
+            seg["end"] = float(seg.get("end", 0)) + start
+            for w in seg.get("words", []) or []:
+                w["start"] = float(w.get("start", 0)) + start
+                w["end"] = float(w.get("end", 0)) + start
+        combined_segments.extend(transcript.get("segments", []))
+
+        clip_filename = f"{video_title}_clip_{i + 1}.mp4"
+        clip_final_path = os.path.join(output_dir, clip_filename)
+        try:
+            success = render_clip(small_path, clip_final_path, output_format)
+        finally:
+            if os.path.exists(small_path):
+                os.remove(small_path)
+        if not success:
+            print(f"   ❌ Clip {i + 1} failed to render.")
+            continue
+        print(f"   🎞️ Clip {i + 1} framed")
+
+        layout_ranges_data = _layouts.read(clip_final_path)
+        split_ranges = _layouts.split_ranges(layout_ranges_data)
+        captioned = auto_caption_clip(
+            clip_final_path, {"language": transcript.get("language", "none"),
+                              "segments": transcript.get("segments", [])},
+            start, end, split_ranges=split_ranges)
+        served = captioned or clip_final_path
+        print(f"   ✅ Clip {i + 1} ready: {clip_final_path}")
+        print(f"CLIP_READY {i} {os.path.basename(served)}")
+
+        shorts.append({
+            "start": round(start, 3), "end": round(end, 3),
+            "proposed": [round(start, 3), round(end, 3)],
+            "video_title_for_youtube_short": f"Clip {i + 1}",
+            "predicted_score": None,
+            "layout_ranges": layout_ranges_data,
+        })
+
+    if not shorts:
+        raise RuntimeError("None of the requested clips could be processed.")
+
+    clips_data = {
+        "shorts": shorts,
+        "transcript": {"language": "unknown", "segments": combined_segments},
+        "output_format": output_format,
+        "manual_clips": True,
+    }
+    metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
+    write_json_atomic(metadata_file, clips_data, indent=2)
+    print(f"   Saved metadata to {metadata_file}")
+    return clips_data
+
+
 def transcribe_video(video_path):
     print("🎙️  Transcribing video...")
     from transcribe_backends import transcribe_media, release_models, host_asr_slot
@@ -2251,6 +2368,16 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             ns, ne = snap_clip_to_words(s.get("start", 0), s.get("end", 0), words, video_duration,
                                         min_duration=min_secs, max_duration=max_secs)
             s["start"], s["end"] = ns, ne
+        # snap_clip_to_words falls back to the model's raw proposal when it
+        # cannot repair a too-short span onto word boundaries (no suitable
+        # word within reach to stretch into, e.g. near a speaker change or
+        # the end of the video) — that fallback is unvalidated, so a clip
+        # a few seconds long can otherwise reach rendering untouched.
+        too_short = [s for s in shorts if s["end"] - s["start"] < min_secs]
+        if too_short:
+            print(f"   Dropped {len(too_short)} clip(s) still under {min_secs}s "
+                  f"after word-snapping could not repair them.")
+            shorts = [s for s in shorts if s["end"] - s["start"] >= min_secs]
         deduped = dedupe_overlapping(shorts)
         if len(deduped) < len(shorts):
             print(f"   Dropped {len(shorts) - len(deduped)} clip(s) overlapping a "
@@ -2533,6 +2660,13 @@ if __name__ == '__main__':
     parser.add_argument('--prepare-only', action='store_true',
                         help="Fetch the source (download, cut to the paid minutes), print "
                              "SOURCE_READY <path> and exit: a remote worker renders it.")
+    parser.add_argument('--manual-clips', type=str,
+                        help="JSON array of [start,end] second pairs (e.g. "
+                             "'[[10,40],[100,130]]'), with -u/--url. Renders exactly "
+                             "these clips: each is downloaded and transcribed on its "
+                             "own, skipping the full-video download, full-video "
+                             "transcription and AI clip-selection the normal pipeline "
+                             "always does first.")
 
     args = parser.parse_args()
     output_format = args.format
@@ -2598,7 +2732,18 @@ if __name__ == '__main__':
         if path:
             os.makedirs(path, exist_ok=True)
         return path
-    
+
+    if args.manual_clips:
+        if not args.url:
+            parser.error("--manual-clips requires -u/--url.")
+        try:
+            manual_clip_ranges = [(float(s), float(e)) for s, e in json.loads(args.manual_clips)]
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            parser.error(f"--manual-clips must be a JSON array of [start,end] pairs: {e}")
+        manual_output_dir = _ensure_dir(args.output) if args.output else "."
+        process_manual_clips(args.url, manual_clip_ranges, manual_output_dir, output_format)
+        sys.exit(0)
+
     # What the stream's viewers clipped (Twitch VODs only; [] otherwise or
     # without TWITCH_CLIENT_ID). A URL call, so it runs before the download and
     # the early pick below gets it too.

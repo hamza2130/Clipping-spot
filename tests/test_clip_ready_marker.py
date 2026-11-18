@@ -70,10 +70,17 @@ class TestMainAnnouncesTheDeliveredFile:
         pipeline is about to supersede, which is the bug this fixes.
         """
         main_src = open("main.py", encoding="utf-8").read()
-        caption_at = main_src.index("captioned = auto_caption_clip(")
+        # Scoped to _process_one_clip itself: other callers (e.g. manual-clip
+        # rendering) legitimately reuse the same auto_caption_clip/CLIP_READY
+        # pattern elsewhere in the file, which would otherwise make a
+        # whole-file .index() pick up the wrong occurrence of one and the
+        # right occurrence of another.
+        fn_at = main_src.index("def _process_one_clip(")
+        fn_src = main_src[fn_at:]
+        caption_at = fn_src.index("captioned = auto_caption_clip(")
         # The free plan's served file is a wm_ copy of the captioned final
         # (mark_delivery), so the marker must also come after that step.
-        served_at = main_src.index("served = captioned or deliver_path")
-        mark_at = main_src.index("served = mark_delivery(served)")
-        marker_at = main_src.index('print(f"CLIP_READY {i} {os.path.basename(served)}")')
+        served_at = fn_src.index("served = captioned or deliver_path")
+        mark_at = fn_src.index("served = mark_delivery(served)")
+        marker_at = fn_src.index('print(f"CLIP_READY {i} {os.path.basename(served)}")')
         assert caption_at < served_at < mark_at < marker_at
