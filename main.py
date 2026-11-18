@@ -2009,18 +2009,20 @@ def process_manual_clips(url, clip_ranges, output_dir, output_format="auto"):
 
     import layout_ranges as _layouts
 
-    video_title = None
-    shorts = []
+    video_title_holder = {"title": None}
     combined_segments = []
 
-    for i, (start, end) in enumerate(clip_ranges):
-        if end <= start:
-            print(f"   ⚠️ Clip {i + 1}: end ({end}) <= start ({start}) — skipping.")
-            continue
+    def _fetch_and_render_one(i, start, end):
+        """One clip end to end. Raises on failure — the caller retries once,
+        then gives up on this clip without taking the rest of the batch
+        down with it (a transient YouTube/bot-detection hiccup on clip 2 of
+        12 must not cost clips 1 and 3-12 their already-finished or
+        not-yet-attempted work)."""
         print(f"\n🎬 Fetching clip {i + 1}: {start:.1f}s - {end:.1f}s")
         small_path, title = download_youtube_video(url, output_dir, clip_range=(start, end))
-        if video_title is None:
-            video_title = title
+        if video_title_holder["title"] is None:
+            video_title_holder["title"] = title
+        video_title = video_title_holder["title"]
 
         try:
             transcript = transcribe_video(small_path)
@@ -2039,7 +2041,6 @@ def process_manual_clips(url, clip_ranges, output_dir, output_format="auto"):
             for w in seg.get("words", []) or []:
                 w["start"] = float(w.get("start", 0)) + start
                 w["end"] = float(w.get("end", 0)) + start
-        combined_segments.extend(transcript.get("segments", []))
 
         clip_filename = f"{video_title}_clip_{i + 1}.mp4"
         clip_final_path = os.path.join(output_dir, clip_filename)
@@ -2049,8 +2050,7 @@ def process_manual_clips(url, clip_ranges, output_dir, output_format="auto"):
             if os.path.exists(small_path):
                 os.remove(small_path)
         if not success:
-            print(f"   ❌ Clip {i + 1} failed to render.")
-            continue
+            raise RuntimeError(f"Clip {i + 1} failed to render.")
         print(f"   🎞️ Clip {i + 1} framed")
 
         layout_ranges_data = _layouts.read(clip_final_path)
@@ -2063,14 +2063,36 @@ def process_manual_clips(url, clip_ranges, output_dir, output_format="auto"):
         print(f"   ✅ Clip {i + 1} ready: {clip_final_path}")
         print(f"CLIP_READY {i} {os.path.basename(served)}")
 
-        shorts.append({
+        return {
             "start": round(start, 3), "end": round(end, 3),
             "proposed": [round(start, 3), round(end, 3)],
             "video_title_for_youtube_short": f"Clip {i + 1}",
             "predicted_score": None,
             "layout_ranges": layout_ranges_data,
-        })
+        }, transcript.get("segments", [])
 
+    shorts = []
+    for i, (start, end) in enumerate(clip_ranges):
+        if end <= start:
+            print(f"   ⚠️ Clip {i + 1}: end ({end}) <= start ({start}) — skipping.")
+            continue
+        for attempt in (1, 2):
+            try:
+                short, segments = _fetch_and_render_one(i, start, end)
+                shorts.append(short)
+                combined_segments.extend(segments)
+                break
+            except Exception as e:
+                print(f"   ❌ Clip {i + 1} failed on attempt {attempt} "
+                      f"({type(e).__name__}: {e}).")
+                if attempt == 1:
+                    print(f"   🔁 Retrying clip {i + 1} once…")
+                    time.sleep(CLIP_RETRY_PAUSE_SECONDS)
+                else:
+                    print(f"   ❌ Clip {i + 1} failed again — skipping it, "
+                          f"continuing with the rest of the batch.")
+
+    video_title = video_title_holder["title"]
     if not shorts:
         raise RuntimeError("None of the requested clips could be processed.")
 
