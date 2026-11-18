@@ -39,8 +39,10 @@ def clip_count_targets(n_windows):
     The old prompt biased hard the other way ("prefer one great clip per
     candidate window") and handed the model two unbounded licences to drop
     clips (the 2-second rule and STANDS ALONE both end in "or skip it"), with
-    no floor to stop it collapsing to a single clip. This puts a floor and a
-    realistic ceiling on it instead.
+    no floor to stop it collapsing to a single clip. This puts a floor on it
+    instead and leaves the ceiling open: a rich source can yield as many
+    clips as the shortlist supports, since the scoring pass already filtered
+    for quality before this function ever sees a window count.
 
     ``CLIP_TARGET_MIN`` / ``CLIP_TARGET_MAX`` override both for A/B runs
     without a deploy (the reframe-testing harness drives them).
@@ -50,8 +52,10 @@ def clip_count_targets(n_windows):
     n = max(1, int(n_windows or 1))
     # Floor grows with the material: 3 windows -> 3, 5 -> 4, 10+ -> 6.
     low = max(2, min(6, n // 2 + 2))
-    # Ceiling allows a rich window to yield more than one without inviting padding.
-    high = min(12, max(4, n * 2))
+    # No ceiling: a rich source may yield as many good clips as it has
+    # material for. The floor above is the only guarantee; quality is
+    # still enforced upstream by the scoring pass that built this shortlist.
+    high = max(4, n * 2)
     low = min(low, high)
 
     def _override(name, current):

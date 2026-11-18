@@ -126,9 +126,12 @@ class TestClipCountTargets:
         assert clip_count_targets(1)[0] <= 2
         assert clip_count_targets(2)[0] <= 3
 
-    def test_ceiling_is_capped_so_long_videos_do_not_explode(self):
-        assert clip_count_targets(40) == clip_count_targets(12)
-        assert clip_count_targets(40)[1] <= 12
+    def test_ceiling_grows_uncapped_with_the_shortlist(self):
+        # No hard ceiling: a richer shortlist may ask for more clips, since
+        # the shortlist itself is already quality-filtered by the scoring
+        # pass. Only the floor (6 once there's enough material) is guaranteed.
+        assert clip_count_targets(40)[1] > clip_count_targets(12)[1]
+        assert clip_count_targets(40)[1] == 80
 
     def test_low_never_exceeds_high(self):
         for n in range(1, 40):
